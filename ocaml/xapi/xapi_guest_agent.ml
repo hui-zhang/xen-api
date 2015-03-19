@@ -98,46 +98,45 @@ let networks path (list: string -> string list) =
 		|> List.map (fun (path, prefix) -> find_all_ips path prefix)
 		|> List.concat
 
-(* This function is passed the "device/vif" node and a function it can use to
- * find the directory listing of sub-nodes. It will return a map where the
- * keys are the xenstore paths of the VIFs' states, and the values are
- * the corresponding state values.
- * Example output for two vifs might be:
- * device/vif/0/state -> 0/state
- * device/vif/1/state -> 1/state
- * *)
-let vif_state path (list: string -> string list) =
-	(* Find all state(s) of vif(s) under a path. *)
-	let find_vifs path = List.fold_left
-		(fun acc vif -> (extend (extend path vif) "state", extend vif "state") :: acc)
-		[] (list path)
-	in
-	path
-		|> find_vifs
+(* This function is passed the "device/vif" node, a function it can use to
+ * find the directory listing of sub-nodes and a function to retrieve the value
+ * with the given path.
+ * If "state" of all VIFs are "4", the return value is true
+ * which means the network paths are optimized.
+ * Or else the return value is false.
+ *)
+let network_paths_optimized path (list: string -> string list) (lookup: string -> string option) =
+	try
+		let _ = List.find (fun vif_id ->
+			let vif_state = lookup (extend (extend path vif_id) "state") in
+			match vif_state with
+    		| Some vifstate -> vifstate <> "4"
+    		| None -> true
+    	) (list path) in
+    	false
+	with Not_found -> true
 
-(*let network_paths_optimized path (list: string -> string list) (lookup: string -> string option) =*)
-	
+(* This function is passed the "device/vbd" node, a function it can use to
+ * find the directory listing of sub-nodes and a function to retrieve the value
+ * with the given path.
+ * If "state" of all VBDs (except cdrom) are "4", the return value is true
+ * which means the storage paths are optimized.
+ * Or else the return value is false.
+ *)
+let storage_paths_optimized path (list: string -> string list) (lookup: string -> string option) =
+	try
+		let _ = List.find (fun vbd_id ->
+			let vbd_state = lookup (extend (extend path vbd_id) "state") in
+			let vbd_type = lookup (extend (extend path vbd_id) "device-type") in
+			match vbd_state, vbd_type with
+			| Some vbdstate, Some vbdtype -> vbdstate <> "4" && vbdtype <> "cdrom"
+			| None, Some vbdtype -> true
+			| Some vbdstate, None -> true
+			| None, None -> true
+		) (list path) in
+		false
+	with Not_found -> true
 
-(* This function is passed the "device/vbd" node and a function it can use to
- * find the directory listing of sub-nodes. It will return a map where the
- * keys are the xenstore paths of the VBDs' state and device-type, and
- * the values are the corresponding state and device-type values.
- * Example output for two vbds might be:
- * device/vbd/5696/state 		-> 5696/state
- * device/vbd/5696/device-type 	-> 5696/device-type
- * device/vbd/768/states 		-> 768/state
- * device/vbd/768/device-type	-> 768/device-type
- * *)
-let vbd_state path (list: string -> string list) =
-	(* Find all state(s) and device-type(s) of vbd(s) under a path. *)
-	let find_vbds path = List.fold_left
-		(fun acc vbd -> (extend (extend path vbd) "state", extend vbd "state") 
-			:: (extend (extend path vbd) "device-type", extend vbd "device-type")
-			:: acc)
-		[] (list path)
-	in
-	path
-		|> find_vbds
 
 (* One key is placed in the other map per control/* key in xenstore. This
    catches keys like "feature-shutdown" "feature-hibernate" "feature-reboot"
@@ -176,10 +175,8 @@ let all (lookup: string -> string option) (list: string -> string list) ~__conte
   and networks = to_map (networks "attr" list)
   and other = List.append (to_map (other all_control)) ts
   and memory = to_map memory
-  (* 0/state -> 4, 1/state -> 1 *)
-  and vif_state = to_map (vif_state "device/vif" list)
-  (* 5696/state -> 1, 5696/device-type -> cdrom, 768/state -> 4, 768/device-type -> disk *)
-  and vbd_state = to_map (vbd_state "device/vbd" list)
+  and network_paths_optimized = network_paths_optimized "device/vif" list lookup
+  and storage_paths_optimized = storage_paths_optimized "device/vbd" list lookup
   and last_updated = Unix.gettimeofday () in
 
   (* let num = Mutex.execute mutex (fun () -> Hashtbl.fold (fun _ _ c -> 1 + c) cache 0) in 
@@ -190,21 +187,6 @@ let all (lookup: string -> string option) (list: string -> string list) ~__conte
   let pv_drivers_version =
     if List.mem_assoc "micro" pv_drivers_version then pv_drivers_version (* already there; do nothing *)
     else ("micro","-1")::pv_drivers_version in
-
-  (* If state of all the VIFs are 4, then the networks path are optimized. *)
-  let network_paths_optimized = List.for_all (fun (k, v) -> v = "4") vif_state in
-
-  (* Except cdrom, if state of all the VBDs are 4, then the storages path are optimized. *)
-  let vbd_cdrom = List.filter (fun (k, v) -> v = "cdrom") vbd_state in
-  let (vbd_cdrom_key, _) = List.split vbd_cdrom in
-  let vbd_cdrom_id = List.map (fun k -> String.sub k 0 (String.length k - String.length "/device-type")) vbd_cdrom_key in
-  let vbd_except_device_type = List.filter (fun (k, v) -> not(String.endswith "/device-type" k)) vbd_state in
-  let vbd_state_except_cdrom = List.concat(List.fold_left (
-	  fun acc id ->
-	  List.filter (fun (k, v) -> not(String.startswith (id ^ "/") k)) vbd_except_device_type
-	  :: acc
-  ) [] vbd_cdrom_id) in
-  let storage_paths_optimized = List.for_all (fun (k, v) -> v = "4") vbd_state_except_cdrom in
 
   let self = Db.VM.get_by_uuid ~__context ~uuid in
 
@@ -284,8 +266,8 @@ let all (lookup: string -> string option) (list: string -> string list) ~__conte
 	      Db.VM.set_guest_metrics ~__context ~self ~value:new_ref; 
 	      (* We've just set the thing to live, let's make sure it's not in the dead list *)
 		  let sl xs = String.concat "; " (List.map (fun (k, v) -> k ^ ": " ^ v) xs) in
-		  info "Received initial update from guest agent in VM %s; os_version = [ %s]; pv_drivers_version = [ %s ]; networks = [ %s ]; vif_state = [ %s ]; vbd_state = [ %s ]"
-		  		(Ref.string_of self) (sl os_version) (sl pv_drivers_version) (sl networks) (sl vif_state) (sl vbd_state);
+		  info "Received initial update from guest agent in VM %s; os_version = [ %s]; pv_drivers_version = [ %s ]; networks = [ %s ]"
+		  		(Ref.string_of self) (sl os_version) (sl pv_drivers_version) (sl networks);
 	      Mutex.execute mutex (fun () -> dead_domains := IntSet.remove domid !dead_domains);
 	      new_ref in
 
@@ -390,8 +372,8 @@ let all (lookup: string -> string option) (list: string -> string list) ~__conte
 			  Db.VM.set_guest_metrics ~__context ~self ~value:new_ref; 
 			  (* We've just set the thing to dead (no guest agent). Now ensure it's in the dead list *)
 			  let sl xs = String.concat "; " (List.map (fun (k, v) -> k ^ ": " ^ v) xs) in
-			  info "Received initial update (but no PV driver version) about VM %s; os_version = [ %s]; other = [ %s ]; pv_drivers_version = [ %s ]; networks = [ %s ]; vif_state = [ %s ]; vbd_state = [ %s ]"
-			  		(Ref.string_of self) (sl os_version) (sl other) (sl pv_drivers_version) (sl networks) (sl vif_state) (sl vbd_state);
+			  info "Received initial update (but no PV driver version) about VM %s; os_version = [ %s]; other = [ %s ]; pv_drivers_version = [ %s ]; networks = [ %s ]"
+			  		(Ref.string_of self) (sl os_version) (sl other) (sl pv_drivers_version) (sl networks);
 			  Mutex.execute mutex (fun () -> dead_domains := IntSet.add domid !dead_domains);
 			  (* Update cache with the empty memory item we've just put into the new guest metrics record. *)
 			  Mutex.execute mutex (fun () -> Hashtbl.replace cache domid (
