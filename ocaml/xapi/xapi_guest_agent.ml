@@ -103,8 +103,8 @@ let networks path (list: string -> string list) =
  * keys are the xenstore paths of the VIFs' states, and the values are
  * the corresponding state values.
  * Example output for two vifs might be:
- * 0/state -> 4
- * 1/state -> 4
+ * device/vif/0/state -> 0/state
+ * device/vif/1/state -> 1/state
  * *)
 let vif_state path (list: string -> string list) =
 	(* Find all state(s) of vif(s) under a path. *)
@@ -115,15 +115,18 @@ let vif_state path (list: string -> string list) =
 	path
 		|> find_vifs
 
+(*let network_paths_optimized path (list: string -> string list) (lookup: string -> string option) =*)
+	
+
 (* This function is passed the "device/vbd" node and a function it can use to
  * find the directory listing of sub-nodes. It will return a map where the
  * keys are the xenstore paths of the VBDs' state and device-type, and
  * the values are the corresponding state and device-type values.
  * Example output for two vbds might be:
- * 5696/state -> 1
- * 5696/device-type -> cdrom
- * 768/state -> 4
- * 768/device-type -> disk
+ * device/vbd/5696/state 		-> 5696/state
+ * device/vbd/5696/device-type 	-> 5696/device-type
+ * device/vbd/768/states 		-> 768/state
+ * device/vbd/768/device-type	-> 768/device-type
  * *)
 let vbd_state path (list: string -> string list) =
 	(* Find all state(s) and device-type(s) of vbd(s) under a path. *)
@@ -149,7 +152,7 @@ let other all_control =
     the results of these lookups differ *)
 
 type m = (string * string) list
-let cache : (int, (m*m*m*m*m*m*m*m*float)) Hashtbl.t = Hashtbl.create 20
+let cache : (int, (m*m*m*m*m*m*bool*bool*float)) Hashtbl.t = Hashtbl.create 20
 let memory_targets : (int, int64) Hashtbl.t = Hashtbl.create 20
 let dead_domains : IntSet.t ref = ref IntSet.empty
 let mutex = Mutex.create ()
@@ -166,14 +169,16 @@ let all (lookup: string -> string option) (list: string -> string list) ~__conte
   let ts = match lookup "data/ts" with
   	| Some value -> ["data-ts",value]
   	| None -> [] in
-  	
+
   let pv_drivers_version = to_map pv_drivers_version
   and os_version = to_map os_version
   and device_id = to_map device_id
   and networks = to_map (networks "attr" list)
   and other = List.append (to_map (other all_control)) ts
   and memory = to_map memory
+  (* 0/state -> 4, 1/state -> 1 *)
   and vif_state = to_map (vif_state "device/vif" list)
+  (* 5696/state -> 1, 5696/device-type -> cdrom, 768/state -> 4, 768/device-type -> disk *)
   and vbd_state = to_map (vbd_state "device/vbd" list)
   and last_updated = Unix.gettimeofday () in
 
@@ -186,6 +191,21 @@ let all (lookup: string -> string option) (list: string -> string list) ~__conte
     if List.mem_assoc "micro" pv_drivers_version then pv_drivers_version (* already there; do nothing *)
     else ("micro","-1")::pv_drivers_version in
 
+  (* If state of all the VIFs are 4, then the networks path are optimized. *)
+  let network_paths_optimized = List.for_all (fun (k, v) -> v = "4") vif_state in
+
+  (* Except cdrom, if state of all the VBDs are 4, then the storages path are optimized. *)
+  let vbd_cdrom = List.filter (fun (k, v) -> v = "cdrom") vbd_state in
+  let (vbd_cdrom_key, _) = List.split vbd_cdrom in
+  let vbd_cdrom_id = List.map (fun k -> String.sub k 0 (String.length k - String.length "/device-type")) vbd_cdrom_key in
+  let vbd_except_device_type = List.filter (fun (k, v) -> not(String.endswith "/device-type" k)) vbd_state in
+  let vbd_state_except_cdrom = List.concat(List.fold_left (
+	  fun acc id ->
+	  List.filter (fun (k, v) -> not(String.startswith (id ^ "/") k)) vbd_except_device_type
+	  :: acc
+  ) [] vbd_cdrom_id) in
+  let storage_paths_optimized = List.for_all (fun (k, v) -> v = "4") vbd_state_except_cdrom in
+
   let self = Db.VM.get_by_uuid ~__context ~uuid in
 
   let (
@@ -195,8 +215,8 @@ let all (lookup: string -> string option) (list: string -> string list) ~__conte
     other_cached,
     memory_cached,
     device_id_cached,
-    vif_state_cached,
-    vbd_state_cached,
+    network_paths_optimized_cached,
+    storage_paths_optimized_cached,
     last_updated_cached
   ) = Mutex.execute mutex (fun () -> try
        Hashtbl.find cache domid 
@@ -210,7 +230,7 @@ let all (lookup: string -> string option) (list: string -> string list) ~__conte
 	dead_domains := IntSet.remove domid !dead_domains
       else
 	dead_domains := IntSet.add domid !dead_domains;
-      ([],[],[],[],[],[],[],[],0.0)) in
+      ([],[],[],[],[],[],false,false,0.0)) in
 
   (* Consider the data valid IF the data/updated key exists AND the pv_drivers_version map
      contains a major and minor version-- this prevents a migration mid-way through an update
@@ -230,7 +250,7 @@ let all (lookup: string -> string option) (list: string -> string list) ~__conte
   then begin
 
       (* Only if the data is valid, cache it (CA-20353) *)
-      Mutex.execute mutex (fun () -> Hashtbl.replace cache domid (pv_drivers_version,os_version,networks,other,memory,device_id,vif_state,vbd_state,last_updated));
+      Mutex.execute mutex (fun () -> Hashtbl.replace cache domid (pv_drivers_version,os_version,networks,other,memory,device_id,network_paths_optimized,storage_paths_optimized,last_updated));
 
       (* We update only if any actual data has changed *)
       if ( pv_drivers_version_cached <> pv_drivers_version 
@@ -243,9 +263,9 @@ let all (lookup: string -> string option) (list: string -> string list) ~__conte
      ||
      device_id_cached <> device_id
      ||
-     vif_state_cached <> vif_state
+     network_paths_optimized_cached <> network_paths_optimized
      ||
-     vbd_state_cached <> vbd_state)
+     storage_paths_optimized_cached <> storage_paths_optimized)
 (* Nb. we're ignoring the memory updates as far as the VM_guest_metrics API object is concerned. We are putting them into an RRD instead *)
 (*	   ||
 	   memory_cached <> memory)*)
@@ -281,23 +301,10 @@ let all (lookup: string -> string option) (list: string -> string list) ~__conte
 	    Db.VM_guest_metrics.set_other ~__context ~self:gm ~value:other;
 	    Helpers.call_api_functions ~__context (fun rpc session_id -> Client.Client.VM.update_allowed_operations rpc session_id self);
 	  end;
-	  if(vif_state_cached <> vif_state) then begin
-	  	(* If state of all the VIFs are 4, then the networks path are optimized. *)
-	  	let network_paths_optimized = List.for_all (fun (k, v) -> v = "4") vif_state in
+	  if(network_paths_optimized_cached <> network_paths_optimized) then begin
 	  	Db.VM_guest_metrics.set_network_paths_optimized ~__context ~self:gm ~value:network_paths_optimized;
 	  end;
-	  if(vbd_state_cached <> vbd_state) then begin
-	  	(* Except cdrom, if state of all the VBDs are 4, then the storages path are optimized. *)
-	  	let vbd_cdrom = List.filter (fun (k, v) -> v = "cdrom") vbd_state in
-	  	let (vbd_cdrom_key, _) = List.split vbd_cdrom in
-	  	let vbd_cdrom_id = List.map (fun k -> String.sub k 0 (String.length k - String.length "/device-type")) vbd_cdrom_key in
-	  	let vbd_except_device_type = List.filter (fun (k, v) -> not(String.endswith "/device-type" k)) vbd_state in
-	  	let vbd_state_except_cdrom = List.concat(List.fold_left (
-	  		fun acc id ->
-	  		List.filter (fun (k, v) -> not(String.startswith (id ^ "/") k)) vbd_except_device_type
-	  		:: acc
-	  	) [] vbd_cdrom_id) in
-	  	let storage_paths_optimized = List.for_all (fun (k, v) -> v = "4") vbd_state_except_cdrom in
+	  if(storage_paths_optimized_cached <> storage_paths_optimized) then begin
 	  	Db.VM_guest_metrics.set_storage_paths_optimized ~__context ~self:gm ~value:storage_paths_optimized;
 	  end;
 (*	  if(memory_cached <> memory) then
@@ -356,8 +363,8 @@ let all (lookup: string -> string option) (list: string -> string list) ~__conte
 		  other, (* not the cached version *)
 		  memory_cached,
 		  device_id_cached,
-		  vif_state_cached,
-		  vbd_state_cached,
+	      network_paths_optimized_cached,
+	      storage_paths_optimized_cached,
 		  last_updated)); (* not a cached version *)
 
 	  let gm =
@@ -394,8 +401,8 @@ let all (lookup: string -> string option) (list: string -> string list) ~__conte
 				  other, (* current version *)
 				  [], (* memory *)
 				  device_id_cached,
-				  vif_state_cached,
-				  vbd_state_cached,
+			      network_paths_optimized_cached,
+			      storage_paths_optimized_cached,
 				  last_updated)); (* not a cached version *)
 			  new_ref
 	  in
